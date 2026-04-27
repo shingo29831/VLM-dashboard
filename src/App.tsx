@@ -1,8 +1,8 @@
 // 役割: VLMの座標取得精度とトークン消費量を検証するためのローカルダッシュボード
-// AI向け役割: モデル一覧の動的取得、複数要素の座標描画、およびトークン使用履歴の管理を行うUIコンポーネント。
-import React, { useState, useRef, useEffect, type MouseEvent, type DragEvent } from 'react';
+// AI向け役割: モデル一覧の動的取得における通信状態（Loading/Success/Error）を監視し、UIに反映する。
+import React, { useState, useRef, useEffect, type MouseEvent } from 'react';
 
-// トークン情報の型定義
+// 型定義
 interface TokenUsage {
   promptTokenCount: number;
   candidatesTokenCount: number;
@@ -20,6 +20,9 @@ interface AIModel {
   displayName: string;
 }
 
+// 通信状態の型
+type FetchStatus = 'idle' | 'loading' | 'success' | 'error';
+
 export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('この画面のスクリーンショットを見てください。主要なボタンや入力欄などのUI要素の位置をすべて教えてください。出力は [ymin, xmin, ymax, xmax] のように、0から1000の相対座標の形式を含めてください。');
@@ -27,6 +30,8 @@ export default function App() {
   // モデル関連
   const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
   const [selectedModel, setSelectedModel] = useState('gemini-flash-latest');
+  const [modelStatus, setModelStatus] = useState<FetchStatus>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   // 解析結果・座標関連
   const [hoverCoords, setHoverCoords] = useState({ x: 0, y: 0 });
@@ -41,18 +46,28 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
 
-  // 初回レンダリング時に利用可能なモデルを取得
+  // モデル一覧取得のロジック
   useEffect(() => {
     const fetchModels = async () => {
+      setModelStatus('loading');
+      setErrorMessage(null);
       try {
+        // バックエンドサーバーへの接続
         const res = await fetch('http://localhost:3001/api/models');
-        if (res.ok) {
-          const data = await res.json();
+        if (!res.ok) throw new Error(`サーバーエラー: ${res.status}`);
+        
+        const data = await res.json();
+        if (data.models && data.models.length > 0) {
           setAvailableModels(data.models);
-          if (data.models.length > 0) setSelectedModel(data.models[0].id);
+          setSelectedModel(data.models[0].id);
+          setModelStatus('success');
+        } else {
+          throw new Error('利用可能なモデルが見つかりませんでした');
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error('モデル一覧の取得に失敗しました:', error);
+        setModelStatus('error');
+        setErrorMessage(error.message || '通信に失敗しました');
       }
     };
     fetchModels();
@@ -107,14 +122,13 @@ export default function App() {
       const data = await response.json();
       setAiResponseText(data.text);
       
-      // トークン使用量を反映
       if (data.usage) {
         setCurrentUsage(data.usage);
         setUsageLog(prev => [{
           timestamp: new Date().toLocaleTimeString(),
           model: selectedModel,
           usage: data.usage
-        }, ...prev].slice(0, 10)); // 直近10件を保持
+        }, ...prev].slice(0, 10));
       }
 
       const regex = /\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]/g;
@@ -131,29 +145,39 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-gray-100 font-sans text-gray-900">
-      {/* サイドバー */}
       <div className="w-1/3 p-6 bg-white shadow-xl flex flex-col gap-6 overflow-y-auto">
         <header>
           <h1 className="text-2xl font-black tracking-tight text-blue-600">VLM RPA ANALYZER</h1>
           <p className="text-xs text-gray-500 font-medium">Graduation Research Dashboard</p>
         </header>
 
-        {/* モデル選択 */}
+        {/* モデル選択 ＆ 接続ステータス表示 */}
         <section>
-          <label className="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Active Model</label>
+          <div className="flex justify-between items-end mb-2">
+            <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Active Model</label>
+            {/* ステータスバッジ */}
+            {modelStatus === 'loading' && <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full animate-pulse">Loading...</span>}
+            {modelStatus === 'success' && <span className="text-[10px] bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-bold">Connected</span>}
+            {modelStatus === 'error' && <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full font-bold">Error</span>}
+          </div>
+          
           <select 
-            className="w-full border-2 border-gray-100 bg-gray-50 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+            className={`w-full border-2 p-3 rounded-xl outline-none transition-all ${
+              modelStatus === 'error' ? 'border-red-200 bg-red-50' : 'border-gray-100 bg-gray-50 focus:ring-2 focus:ring-blue-500'
+            }`}
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value)}
+            disabled={modelStatus !== 'success'}
           >
-            {availableModels.length > 0 ? (
-              availableModels.map(m => (
-                <option key={m.id} value={m.id}>{m.id}</option>
-              ))
+            {modelStatus === 'success' ? (
+              availableModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)
             ) : (
-              <option>Loading models...</option>
+              <option>{errorMessage || 'モデルを読み込み中...'}</option>
             )}
           </select>
+          {modelStatus === 'error' && (
+            <p className="text-[10px] text-red-500 mt-1 font-medium">※バックエンドサーバーが起動しているか確認してください</p>
+          )}
         </section>
 
         {/* アップロードエリア */}
@@ -184,13 +208,13 @@ export default function App() {
 
         <button 
           onClick={handleRunAi}
-          disabled={!imageSrc}
+          disabled={!imageSrc || modelStatus !== 'success'}
           className="w-full bg-blue-600 text-white py-4 rounded-2xl hover:bg-blue-700 disabled:bg-gray-200 font-bold shadow-lg shadow-blue-200 transition-all active:scale-95"
         >
           推論を実行
         </button>
 
-        {/* 今回追加：トークン使用量表示エリア */}
+        {/* トークン使用量表示 */}
         {currentUsage && (
           <section className="bg-blue-50 p-4 rounded-2xl border border-blue-100 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <h3 className="text-xs font-bold text-blue-600 uppercase tracking-widest mb-3">Last Request Usage</h3>
@@ -211,7 +235,7 @@ export default function App() {
           </section>
         )}
 
-        {/* 今回追加：履歴ログ */}
+        {/* 履歴ログ */}
         {usageLog.length > 0 && (
           <section className="mt-2">
             <label className="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Usage History</label>
@@ -219,7 +243,7 @@ export default function App() {
               {usageLog.map((log, i) => (
                 <div key={i} className="flex justify-between items-center text-[11px] bg-gray-50 p-2 rounded-lg border border-gray-100">
                   <span className="text-gray-400 font-mono">{log.timestamp}</span>
-                  <span className="font-bold text-gray-600 truncate max-w-[80px]">{log.model}</span>
+                  <span className="font-bold text-gray-600 truncate max-w-20">{log.model}</span>
                   <span className="bg-gray-200 px-2 py-0.5 rounded-full font-bold">{log.usage.totalTokenCount} tokens</span>
                 </div>
               ))}
@@ -228,7 +252,7 @@ export default function App() {
         )}
       </div>
 
-      {/* メインプレビューエリア */}
+      {/* プレビューエリア */}
       <main className="flex-1 p-8 flex flex-col gap-6 overflow-hidden">
         <div className="flex justify-between items-center bg-white px-6 py-4 rounded-2xl shadow-sm border border-gray-100">
           <h2 className="font-bold text-gray-500">Preview Canvas</h2>
@@ -275,7 +299,6 @@ export default function App() {
           )}
         </div>
 
-        {/* AIレスポンスの下部表示 */}
         <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100 max-h-48 overflow-y-auto">
           <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3">AI Raw Output</h3>
           <p className="text-sm text-gray-700 leading-relaxed font-medium">
