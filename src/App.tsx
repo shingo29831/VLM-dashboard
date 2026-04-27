@@ -1,5 +1,5 @@
 // 役割: VLMの座標取得精度とトークン消費量を検証するためのローカルダッシュボード
-// AI向け役割: モデル一覧の動的取得における通信状態（Loading/Success/Error）を監視し、UIに反映する。
+// AI向け役割: 画像の本来の解像度(naturalWidth/Height)を取得し、推論精度向上のためプロンプトにメタデータとして自動付与してAPIへ送信するUIコンポーネント。
 import React, { useState, useRef, useEffect, type MouseEvent } from 'react';
 
 // 型定義
@@ -20,25 +20,24 @@ interface AIModel {
   displayName: string;
 }
 
-// 通信状態の型
 type FetchStatus = 'idle' | 'loading' | 'success' | 'error';
 
 export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState('この画面のスクリーンショットを見てください。主要なボタンや入力欄などのUI要素の位置をすべて教えてください。出力は [ymin, xmin, ymax, xmax] のように、0から1000の相対座標の形式を含めてください。');
+  // 画像の解像度を保持するステートを追加
+  const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
   
-  // モデル関連
+  const [prompt, setPrompt] = useState('この画面のスクリーンショットを見てください。主要なボタンや入力欄などのUI要素の位置をすべて教えてください。出力は [ymin, xmin, ymax, xmax] のように、画像の左上を[0,0]、右下を[1000,1000]とした相対座標の形式を含めてください。');
+  
   const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
   const [selectedModel, setSelectedModel] = useState('gemini-flash-latest');
   const [modelStatus, setModelStatus] = useState<FetchStatus>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
-  // 解析結果・座標関連
   const [hoverCoords, setHoverCoords] = useState({ x: 0, y: 0 });
   const [aiBoxCoords, setAiBoxCoords] = useState<number[][]>([]);
   const [aiResponseText, setAiResponseText] = useState('');
   
-  // トークン管理関連
   const [currentUsage, setCurrentUsage] = useState<TokenUsage | null>(null);
   const [usageLog, setUsageLog] = useState<UsageHistory[]>([]);
   
@@ -46,13 +45,11 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
 
-  // モデル一覧取得のロジック
   useEffect(() => {
     const fetchModels = async () => {
       setModelStatus('loading');
       setErrorMessage(null);
       try {
-        // バックエンドサーバーへの接続
         const res = await fetch('http://localhost:3001/api/models');
         if (!res.ok) throw new Error(`サーバーエラー: ${res.status}`);
         
@@ -76,7 +73,17 @@ export default function App() {
   const processImageFile = (file: File) => {
     if (!file.type.startsWith('image/')) return;
     const reader = new FileReader();
-    reader.onload = (event) => setImageSrc(event.target?.result as string);
+    reader.onload = (event) => {
+      const result = event.target?.result as string;
+      setImageSrc(result);
+      
+      // 画像の実際の解像度を取得してステートに保存
+      const img = new Image();
+      img.onload = () => {
+        setImageDimensions({ width: img.naturalWidth, height: img.naturalHeight });
+      };
+      img.src = result;
+    };
     reader.readAsDataURL(file);
     setAiBoxCoords([]);
     setAiResponseText('');
@@ -107,9 +114,14 @@ export default function App() {
       const resBlob = await fetch(imageSrc);
       const blob = await resBlob.blob();
 
+      // プロンプトの先頭に、画像サイズに関するシステムメタデータを自動付与
+      const enhancedPrompt = imageDimensions 
+        ? `[システム設定: 解析対象の画像サイズは 幅 ${imageDimensions.width}px, 高さ ${imageDimensions.height}px です。この解像度を基準にして、0-1000の相対座標を正確に推論してください。]\n\n${prompt}`
+        : prompt;
+
       const formData = new FormData();
       formData.append('image', blob, 'screenshot.png');
-      formData.append('prompt', prompt);
+      formData.append('prompt', enhancedPrompt);
       formData.append('model', selectedModel);
 
       const response = await fetch('http://localhost:3001/api/analyze', {
@@ -151,11 +163,9 @@ export default function App() {
           <p className="text-xs text-gray-500 font-medium">Graduation Research Dashboard</p>
         </header>
 
-        {/* モデル選択 ＆ 接続ステータス表示 */}
         <section>
           <div className="flex justify-between items-end mb-2">
             <label className="text-xs font-bold text-gray-500 uppercase tracking-widest">Active Model</label>
-            {/* ステータスバッジ */}
             {modelStatus === 'loading' && <span className="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded-full animate-pulse">Loading...</span>}
             {modelStatus === 'success' && <span className="text-[10px] bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-bold">Connected</span>}
             {modelStatus === 'error' && <span className="text-[10px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full font-bold">Error</span>}
@@ -175,12 +185,8 @@ export default function App() {
               <option>{errorMessage || 'モデルを読み込み中...'}</option>
             )}
           </select>
-          {modelStatus === 'error' && (
-            <p className="text-[10px] text-red-500 mt-1 font-medium">※バックエンドサーバーが起動しているか確認してください</p>
-          )}
         </section>
 
-        {/* アップロードエリア */}
         <section>
           <label className="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Target Image</label>
           <div 
@@ -196,7 +202,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* プロンプト入力 */}
         <section>
           <label className="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">System Prompt</label>
           <textarea 
@@ -214,7 +219,6 @@ export default function App() {
           推論を実行
         </button>
 
-        {/* トークン使用量表示 */}
         {currentUsage && (
           <section className="bg-blue-50 p-4 rounded-2xl border border-blue-100 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <h3 className="text-xs font-bold text-blue-600 uppercase tracking-widest mb-3">Last Request Usage</h3>
@@ -235,7 +239,6 @@ export default function App() {
           </section>
         )}
 
-        {/* 履歴ログ */}
         {usageLog.length > 0 && (
           <section className="mt-2">
             <label className="block text-xs font-bold text-gray-500 uppercase tracking-widest mb-2">Usage History</label>
@@ -252,10 +255,17 @@ export default function App() {
         )}
       </div>
 
-      {/* プレビューエリア */}
       <main className="flex-1 p-8 flex flex-col gap-6 overflow-hidden">
         <div className="flex justify-between items-center bg-white px-6 py-4 rounded-2xl shadow-sm border border-gray-100">
-          <h2 className="font-bold text-gray-500">Preview Canvas</h2>
+          <div className="flex items-center gap-4">
+            <h2 className="font-bold text-gray-500">Preview Canvas</h2>
+            {/* オリジナルの画像解像度を表示 */}
+            {imageDimensions && (
+              <span className="bg-gray-100 text-gray-600 px-3 py-1 rounded-full text-[11px] font-bold tracking-wider border border-gray-200">
+                ORIGINAL: {imageDimensions.width} × {imageDimensions.height} px
+              </span>
+            )}
+          </div>
           <div className="flex gap-4">
             <div className="bg-gray-900 text-green-400 px-4 py-2 rounded-xl font-mono text-xs shadow-inner">
               X: {hoverCoords.x.toString().padStart(4, '0')}
@@ -278,7 +288,7 @@ export default function App() {
             <div className="relative inline-block group">
               <img 
                 ref={imageRef} src={imageSrc} alt="Target UI" 
-                className="max-h-[70vh] w-auto cursor-crosshair rounded-xl shadow-2xl transition-all"
+                className="max-h-[70vh] w-auto cursor-crosshair shadow-2xl transition-all"
                 onMouseMove={handleMouseMove}
               />
               {aiBoxCoords.map((coords, i) => (
