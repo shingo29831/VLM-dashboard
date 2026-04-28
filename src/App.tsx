@@ -1,5 +1,7 @@
-// 役割: VLMの座標取得精度とトークン消費量を検証するためのローカルダッシュボード
-// AI向け役割: シンプルなプロンプトを使用し、CSSの余白(object-contain)による座標ズレを排除した正確なバウンディングボックス描画を行うUIコンポーネント。
+/**
+ * 役割: OCR/VLM/YOLO の解析結果を可視化・デバッグするためのダッシュボードUI
+ * AI向け役割: 座標データの正規化、レイヤー別の表示切り替え、およびトークン使用履歴の管理を行う。
+ */
 import React, { useState, useRef, useEffect, type MouseEvent } from 'react';
 
 interface TokenUsage {
@@ -23,19 +25,28 @@ type FetchStatus = 'idle' | 'loading' | 'success' | 'error';
 
 export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
-  
-  // 解像度変更の影響を防ぐため、絶対座標や1000スケールではなく「0.00〜1.00の比率」で出力させるようにプロンプトを修正
-  const [prompt, setPrompt] = useState('あなたはRPA向けの高度な視覚UI解析システムです。\n画像は処理時に解像度が変更される可能性があるため、絶対的なピクセル座標ではなく「画像全体の幅と高さをそれぞれ1.0とした比率（0.000〜1.000）」でUI要素の位置を推測してください。\n\n【厳守事項】\n1. 「正確には分かりません」「できません」などの言い訳や拒否は絶対に含めないでください。\n2. ボタンなどのクリック操作できる各要素の名前と、[ymin, xmin, ymax, xmax] の形式の比率データ（例: [0.150, 0.200, 0.180, 0.400]）のみを簡潔にリストアップしてください。');  
+  const [prompt, setPrompt] = useState('画面内の主要なメニューやボタンをすべてリストアップしてください。');  
   const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
   const [selectedModel, setSelectedModel] = useState('gemini-flash-latest');
   const [modelStatus, setModelStatus] = useState<FetchStatus>('idle');
+  
+  // TypeScript警告(6133)の解消: エラーメッセージを表示用に活用
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   
   const [hoverCoords, setHoverCoords] = useState({ x: 0, y: 0 });
+  
   const [aiBoxCoords, setAiBoxCoords] = useState<number[][]>([]);
+  const [ocrBoxCoords, setOcrBoxCoords] = useState<any[]>([]); 
+  const [yoloBoxCoords, setYoloBoxCoords] = useState<any[]>([]); 
   const [aiResponseText, setAiResponseText] = useState('');
+
+  const [showOcr, setShowOcr] = useState(true);
+  const [showVlm, setShowVlm] = useState(true);
+  const [showYolo, setShowYolo] = useState(true);
   
   const [currentUsage, setCurrentUsage] = useState<TokenUsage | null>(null);
+  
+  // TypeScript警告(6133)の解消: 使用履歴をUI下部に表示
   const [usageLog, setUsageLog] = useState<UsageHistory[]>([]);
   
   const [isDragging, setIsDragging] = useState(false);
@@ -60,7 +71,7 @@ export default function App() {
       } catch (error: any) {
         console.error('モデル一覧の取得に失敗しました:', error);
         setModelStatus('error');
-        setErrorMessage(error.message || '通信に失敗しました');
+        setErrorMessage(error.message || 'モデルの取得中に不明なエラーが発生しました');
       }
     };
     fetchModels();
@@ -74,6 +85,8 @@ export default function App() {
     };
     reader.readAsDataURL(file);
     setAiBoxCoords([]);
+    setOcrBoxCoords([]);
+    setYoloBoxCoords([]);
     setAiResponseText('');
     setCurrentUsage(null);
   };
@@ -83,25 +96,20 @@ export default function App() {
     if (file) processImageFile(file);
   };
 
-  // 0.000〜1.000の比率ベースの座標計算に変更
   const handleMouseMove = (e: MouseEvent<HTMLImageElement>) => {
     if (!imageRef.current) return;
     const rect = imageRef.current.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    
-    const boundedX = Math.max(0, Math.min(x, rect.width));
-    const boundedY = Math.max(0, Math.min(y, rect.height));
-    
-    const relativeX = boundedX / rect.width;
-    const relativeY = boundedY / rect.height;
-    setHoverCoords({ x: relativeX, y: relativeY });
+    setHoverCoords({ x: x / rect.width, y: y / rect.height });
   };
 
   const handleRunAi = async () => {
     if (!imageSrc) return;
     setAiResponseText('AIに問い合わせ中...');
     setAiBoxCoords([]);
+    setOcrBoxCoords([]);
+    setErrorMessage(null);
 
     try {
       const resBlob = await fetch(imageSrc);
@@ -117,10 +125,12 @@ export default function App() {
         body: formData,
       });
 
-      if (!response.ok) throw new Error('サーバー通信エラー');
-
+      if (!response.ok) throw new Error(`解析サーバーエラー: ${response.status}`);
       const data = await response.json();
+      
       setAiResponseText(data.text);
+      if (data.ocrElements) setOcrBoxCoords(data.ocrElements);
+      if (data.yoloElements) setYoloBoxCoords(data.yoloElements);
       
       if (data.usage) {
         setCurrentUsage(data.usage);
@@ -131,7 +141,6 @@ export default function App() {
         }, ...prev].slice(0, 10));
       }
 
-      // 小数点(0.150)と整数(150)の両方にマッチする正規表現
       const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
       const matches = [...data.text.matchAll(regex)];
       const extractedCoords = matches.map(match => [
@@ -140,41 +149,64 @@ export default function App() {
       ]);
       setAiBoxCoords(extractedCoords);
     } catch (error: any) {
-      setAiResponseText('エラー: ' + error.message);
+      setAiResponseText('エラーが発生しました。');
+      setErrorMessage(error.message);
     }
   };
 
   return (
-    <div className="flex h-screen bg-gray-100 font-sans text-gray-900">
+    <div className="flex h-screen bg-gray-100 font-sans text-gray-900 overflow-hidden">
+      {/* 左サイドバー */}
       <div className="w-1/3 p-6 bg-white shadow-xl flex flex-col gap-6 overflow-y-auto border-r border-gray-200">
         <header>
           <h1 className="text-2xl font-black tracking-tight text-blue-600">VLM RPA ANALYZER</h1>
           <p className="text-xs text-gray-400 font-bold uppercase tracking-tighter">Graduation Research Dashboard</p>
         </header>
 
-        <section>
-          <div className="flex justify-between items-end mb-2">
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Active Model</label>
-            {modelStatus === 'success' && <span className="text-[9px] bg-green-100 text-green-600 px-2 py-0.5 rounded-full font-bold">Online</span>}
-            {modelStatus === 'error' && <span className="text-[9px] bg-red-100 text-red-600 px-2 py-0.5 rounded-full font-bold">Offline</span>}
+        {/* レイヤー切り替え */}
+        <section className="bg-gray-50 p-4 rounded-2xl border border-gray-100 flex flex-col gap-3">
+          <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block">Display Layers</label>
+          <div className="flex flex-wrap gap-2">
+            <button 
+              onClick={() => setShowOcr(!showOcr)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${showOcr ? 'bg-blue-500 text-white shadow-md' : 'bg-white text-gray-400 border border-gray-200'}`}
+            >
+              OCR (Blue)
+            </button>
+            <button 
+              onClick={() => setShowVlm(!showVlm)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${showVlm ? 'bg-red-500 text-white shadow-md' : 'bg-white text-gray-400 border border-gray-200'}`}
+            >
+              VLM (Red)
+            </button>
+            <button 
+              onClick={() => setShowYolo(!showYolo)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${showYolo ? 'bg-green-500 text-white shadow-md' : 'bg-white text-gray-400 border border-gray-200'}`}
+            >
+              YOLO (Green)
+            </button>
           </div>
+        </section>
+
+        {/* モデル選択 */}
+        <section>
+          <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-2">Active Model</label>
           <select 
-            className="w-full border-2 border-gray-50 bg-gray-50 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none transition-all text-sm font-medium"
+            className="w-full border-2 border-gray-50 bg-gray-50 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm font-medium"
             value={selectedModel}
             onChange={(e) => setSelectedModel(e.target.value)}
             disabled={modelStatus !== 'success'}
           >
-            {modelStatus === 'success' ? (
-              availableModels.map(m => <option key={m.id} value={m.id}>{m.id}</option>)
-            ) : (
-              <option>Loading models...</option>
-            )}
+            {availableModels.map(m => <option key={m.id} value={m.id}>{m.displayName}</option>)}
           </select>
-          {modelStatus === 'error' && errorMessage && (
-            <p className="text-[10px] text-red-500 mt-2 font-medium">{errorMessage}</p>
+          {errorMessage && (
+            <p className="text-[10px] text-red-500 mt-2 font-medium bg-red-50 p-2 rounded-lg border border-red-100">
+              ⚠️ {errorMessage}
+            </p>
           )}
         </section>
 
+        {/* 画像アップロード */}
         <section className="flex flex-col gap-2">
           <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Target Image</label>
           <div 
@@ -207,82 +239,109 @@ export default function App() {
           Run Analysis
         </button>
 
-        {currentUsage && (
-          <section className="bg-blue-50/50 p-4 rounded-2xl border border-blue-100 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <h3 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest mb-3">Usage Stats</h3>
-            <div className="grid grid-cols-3 gap-2">
-              <div className="bg-white p-2 rounded-lg text-center shadow-sm">
-                <p className="text-[9px] text-gray-400 font-bold uppercase">In</p>
-                <p className="text-sm font-black text-gray-700">{currentUsage.promptTokenCount}</p>
-              </div>
-              <div className="bg-white p-2 rounded-lg text-center shadow-sm">
-                <p className="text-[9px] text-gray-400 font-bold uppercase">Out</p>
-                <p className="text-sm font-black text-gray-700">{currentUsage.candidatesTokenCount}</p>
-              </div>
-              <div className="bg-white p-2 rounded-lg text-center shadow-sm border border-blue-200">
-                <p className="text-[9px] text-blue-400 font-bold uppercase">Total</p>
-                <p className="text-sm font-black text-blue-600">{currentUsage.totalTokenCount}</p>
-              </div>
-            </div>
-          </section>
-        )}
-
-        {usageLog.length > 0 && (
-          <section className="mt-2 flex-1 overflow-y-auto">
-            <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-2">Usage History</label>
-            <div className="flex flex-col gap-2">
-              {usageLog.map((log, i) => (
-                <div key={i} className="flex justify-between items-center text-[11px] bg-gray-50 p-2 rounded-lg border border-gray-100">
-                  <span className="text-gray-400 font-mono">{log.timestamp}</span>
-                  <span className="font-bold text-gray-600 truncate max-w-20">{log.model}</span>
-                  <span className="bg-gray-200 px-2 py-0.5 rounded-full font-bold text-gray-700">{log.usage.totalTokenCount} tokens</span>
+        {/* 履歴と統計 */}
+        <section className="flex flex-col gap-4 mt-auto">
+          {currentUsage && (
+            <div className="bg-blue-50/50 p-4 rounded-2xl border border-blue-100">
+              <h3 className="text-[10px] font-bold text-blue-400 uppercase tracking-widest mb-3">Usage Stats</h3>
+              <div className="grid grid-cols-3 gap-2">
+                <div className="bg-white p-2 rounded-lg text-center shadow-sm">
+                  <p className="text-[9px] text-gray-400 font-bold">In</p>
+                  <p className="text-xs font-black text-gray-700">{currentUsage.promptTokenCount}</p>
                 </div>
-              ))}
+                <div className="bg-white p-2 rounded-lg text-center shadow-sm">
+                  <p className="text-[9px] text-gray-400 font-bold">Out</p>
+                  <p className="text-xs font-black text-gray-700">{currentUsage.candidatesTokenCount}</p>
+                </div>
+                <div className="bg-white p-2 rounded-lg text-center shadow-sm border border-blue-200">
+                  <p className="text-[9px] text-blue-400 font-bold">Total</p>
+                  <p className="text-xs font-black text-blue-600">{currentUsage.totalTokenCount}</p>
+                </div>
+              </div>
             </div>
-          </section>
-        )}
+          )}
+
+          {usageLog.length > 0 && (
+            <div className="max-h-32 overflow-y-auto pr-2">
+              <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest block mb-2">History</label>
+              <div className="flex flex-col gap-1.5">
+                {usageLog.map((log, i) => (
+                  <div key={i} className="flex justify-between items-center text-[10px] bg-gray-50 p-2 rounded-lg border border-gray-100">
+                    <span className="text-gray-400">{log.timestamp}</span>
+                    <span className="font-bold text-blue-600">{log.usage.totalTokenCount} tokens</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
       </div>
 
-      <main className="flex-1 p-8 flex flex-col gap-6 bg-gray-50/50">
+      {/* メインプレビュー */}
+      <main className="flex-1 p-8 flex flex-col gap-6 bg-gray-50/50 overflow-hidden">
         <div className="flex justify-between items-center">
           <h2 className="text-lg font-black text-gray-800 tracking-tight">Preview Canvas</h2>
           <div className="flex gap-4">
-            <div className="bg-gray-900 text-green-400 px-4 py-2 rounded-xl font-mono text-xs shadow-inner">
-              X: {hoverCoords.x.toFixed(3)}
-            </div>
-            <div className="bg-gray-900 text-green-400 px-4 py-2 rounded-xl font-mono text-xs shadow-inner">
-              Y: {hoverCoords.y.toFixed(3)}
-            </div>
+            <div className="bg-gray-900 text-green-400 px-4 py-2 rounded-xl font-mono text-xs shadow-inner">X: {hoverCoords.x.toFixed(3)}</div>
+            <div className="bg-gray-900 text-green-400 px-4 py-2 rounded-xl font-mono text-xs shadow-inner">Y: {hoverCoords.y.toFixed(3)}</div>
           </div>
         </div>
 
-        <div className="flex-1 bg-white rounded-3xl border border-gray-200 flex items-center justify-center overflow-hidden relative shadow-sm p-4">
+        <div className="flex-1 bg-white rounded-3xl border border-gray-200 flex items-center justify-center overflow-auto relative shadow-sm p-8">
           {!imageSrc ? (
             <div className="text-gray-300 flex flex-col items-center">
-              <svg className="w-12 h-12 mb-2 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-              <p className="font-bold text-xs">No image provided</p>
+              <p className="font-bold text-xs uppercase tracking-widest">No image provided</p>
             </div>
           ) : (
-            // inline-block で img 要素とぴったり同じサイズのコンテナを作る
-            <div className="relative inline-block">
+            <div className="relative inline-block m-4">
               <img 
                 ref={imageRef} 
                 src={imageSrc} 
                 alt="Target UI" 
-                // 余白(object-contain)を作らず、max制約のみで縦横比を維持させる
-                className="max-h-[70vh] max-w-full block cursor-crosshair rounded shadow-md"
+                className="max-h-[70vh] max-w-full block cursor-crosshair shadow-2xl ring-4 ring-gray-100"
                 style={{ width: 'auto', height: 'auto' }}
                 onMouseMove={handleMouseMove}
               />
-              {aiBoxCoords.map((coords, i) => {
-                // モデルが1000ベースで返した場合は1000で割り、比率(0.0~1.0)ならそのまま使う安全なスケール計算
-                const isThousandScale = coords.some(c => c > 1);
-                const scale = isThousandScale ? 1000 : 1;
+              
+              {/* OCR レイヤー (青) */}
+              {showOcr && ocrBoxCoords.map((el, i) => (
+                <div 
+                  key={`ocr-${i}`}
+                  className="absolute border border-blue-400 bg-blue-400/10 pointer-events-none transition-all"
+                  style={{
+                    top: `${el.bounding_box[0] / 10}%`, 
+                    left: `${el.bounding_box[1] / 10}%`,
+                    height: `${(el.bounding_box[2] - el.bounding_box[0]) / 10}%`, 
+                    width: `${(el.bounding_box[3] - el.bounding_box[1]) / 10}%`
+                  }}
+                >
+                  <span className="absolute -top-4 left-0 text-[8px] bg-blue-500 text-white px-1 rounded shadow-sm z-30">{el.text}</span>
+                </div>
+              ))}
 
+              {/* YOLO レイヤー (緑) - 将来用 */}
+              {showYolo && yoloBoxCoords.map((el: any, i: number) => (
+                <div 
+                  key={`yolo-${i}`}
+                  className="absolute border-2 border-green-500 bg-green-500/10 pointer-events-none transition-all z-20"
+                  style={{
+                    top: `${el.bounding_box[0] / 10}%`, 
+                    left: `${el.bounding_box[1] / 10}%`,
+                    height: `${(el.bounding_box[2] - el.bounding_box[0]) / 10}%`, 
+                    width: `${(el.bounding_box[3] - el.bounding_box[1]) / 10}%`
+                  }}
+                >
+                  <span className="absolute -bottom-4 left-0 text-[8px] bg-green-600 text-white px-1 rounded shadow-sm">{el.label}</span>
+                </div>
+              ))}
+
+              {/* VLM レイヤー (赤) */}
+              {showVlm && aiBoxCoords.map((coords, i) => {
+                const scale = coords.some(c => c > 1) ? 1000 : 1;
                 return (
                   <div 
-                    key={i}
-                    className="absolute border-2 border-red-500 bg-red-500/10 pointer-events-none transition-all duration-500"
+                    key={`vlm-${i}`}
+                    className="absolute border-2 border-red-500 bg-red-500/20 pointer-events-none transition-all z-40 shadow-[0_0_10px_rgba(239,68,68,0.5)]"
                     style={{
                       top: `${(coords[0] / scale) * 100}%`, 
                       left: `${(coords[1] / scale) * 100}%`,
@@ -290,9 +349,7 @@ export default function App() {
                       width: `${((coords[3] - coords[1]) / scale) * 100}%`
                     }}
                   >
-                    <span className="absolute -top-6 -left-0.5 bg-red-500 text-[9px] text-white px-2 py-0.5 rounded font-black shadow-lg">
-                      #{i + 1}
-                    </span>
+                    <span className="absolute -top-6 left-0 bg-red-500 text-[9px] text-white px-2 py-0.5 rounded font-black shadow-lg">#{i + 1} Selected</span>
                   </div>
                 );
               })}
@@ -302,9 +359,7 @@ export default function App() {
 
         <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-200 h-40 overflow-y-auto">
           <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3">AI Analysis Data</h3>
-          <p className="text-sm text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">
-            {aiResponseText || "Results will appear here..."}
-          </p>
+          <p className="text-sm text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">{aiResponseText || "Results will appear here..."}</p>
         </div>
       </main>
     </div>
