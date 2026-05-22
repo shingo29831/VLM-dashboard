@@ -1,6 +1,6 @@
 /**
  * 役割: OCR/VLM/YOLO の解析結果を可視化・デバッグするためのダッシュボードUI
- * AI向け役割: 座標データの正規化、レイヤー別の表示切り替え、およびトークン使用履歴の管理を行う。
+ * AI向け役割: 座標データの正規化、レイヤー別の表示切り替え、トークン使用履歴の管理、および各エンジンの解析ログをタブ表示する。
  */
 import React, { useState, useRef, useEffect, type MouseEvent } from 'react';
 
@@ -22,6 +22,7 @@ interface AIModel {
 }
 
 type FetchStatus = 'idle' | 'loading' | 'success' | 'error';
+type LogTab = 'vlm' | 'ocr' | 'yolo';
 
 export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
@@ -30,9 +31,7 @@ export default function App() {
   const [selectedModel, setSelectedModel] = useState('gemini-flash-latest');
   const [modelStatus, setModelStatus] = useState<FetchStatus>('idle');
   
-  // TypeScript警告(6133)の解消: エラーメッセージを表示用に活用
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  
   const [hoverCoords, setHoverCoords] = useState({ x: 0, y: 0 });
   
   const [aiBoxCoords, setAiBoxCoords] = useState<number[][]>([]);
@@ -45,9 +44,9 @@ export default function App() {
   const [showYolo, setShowYolo] = useState(true);
   
   const [currentUsage, setCurrentUsage] = useState<TokenUsage | null>(null);
-  
-  // TypeScript警告(6133)の解消: 使用履歴をUI下部に表示
   const [usageLog, setUsageLog] = useState<UsageHistory[]>([]);
+  
+  const [activeLogTab, setActiveLogTab] = useState<LogTab>('vlm');
   
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -109,6 +108,7 @@ export default function App() {
     setAiResponseText('AIに問い合わせ中...');
     setAiBoxCoords([]);
     setOcrBoxCoords([]);
+    setYoloBoxCoords([]);
     setErrorMessage(null);
 
     try {
@@ -298,7 +298,7 @@ export default function App() {
                 ref={imageRef} 
                 src={imageSrc} 
                 alt="Target UI" 
-                className="max-h-[70vh] max-w-full block cursor-crosshair shadow-2xl ring-4 ring-gray-100"
+                className="max-h-[60vh] max-w-full block cursor-crosshair shadow-2xl ring-4 ring-gray-100"
                 style={{ width: 'auto', height: 'auto' }}
                 onMouseMove={handleMouseMove}
               />
@@ -319,7 +319,7 @@ export default function App() {
                 </div>
               ))}
 
-              {/* YOLO レイヤー (緑) - 将来用 */}
+              {/* YOLO レイヤー (緑) */}
               {showYolo && yoloBoxCoords.map((el: any, i: number) => (
                 <div 
                   key={`yolo-${i}`}
@@ -357,9 +357,46 @@ export default function App() {
           )}
         </div>
 
-        <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-200 h-40 overflow-y-auto">
-          <h3 className="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-3">AI Analysis Data</h3>
-          <p className="text-sm text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">{aiResponseText || "Results will appear here..."}</p>
+        {/* ログビューアー (タブ切り替え) */}
+        <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-200 h-56 flex flex-col">
+          <div className="flex border-b border-gray-100 mb-4 pb-2 gap-6">
+            <button
+              onClick={() => setActiveLogTab('vlm')}
+              className={`text-[10px] font-bold uppercase tracking-widest pb-2 border-b-2 transition-all ${activeLogTab === 'vlm' ? 'border-red-500 text-red-600' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
+            >
+              VLM Result
+            </button>
+            <button
+              onClick={() => setActiveLogTab('ocr')}
+              className={`text-[10px] font-bold uppercase tracking-widest pb-2 border-b-2 transition-all ${activeLogTab === 'ocr' ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
+            >
+              OCR Log ({ocrBoxCoords.length})
+            </button>
+            <button
+              onClick={() => setActiveLogTab('yolo')}
+              className={`text-[10px] font-bold uppercase tracking-widest pb-2 border-b-2 transition-all ${activeLogTab === 'yolo' ? 'border-green-500 text-green-600' : 'border-transparent text-gray-400 hover:text-gray-600'}`}
+            >
+              YOLO Log ({yoloBoxCoords.length})
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto">
+            {activeLogTab === 'vlm' && (
+              <p className="text-sm text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">
+                {aiResponseText || "VLM results will appear here..."}
+              </p>
+            )}
+            {activeLogTab === 'ocr' && (
+              <pre className="text-xs text-gray-600 font-mono whitespace-pre-wrap">
+                {ocrBoxCoords.length > 0 ? JSON.stringify(ocrBoxCoords, null, 2) : "No OCR data available."}
+              </pre>
+            )}
+            {activeLogTab === 'yolo' && (
+              <pre className="text-xs text-gray-600 font-mono whitespace-pre-wrap">
+                {yoloBoxCoords.length > 0 ? JSON.stringify(yoloBoxCoords, null, 2) : "No YOLO data available. (403 Forbidden or not executed)"}
+              </pre>
+            )}
+          </div>
         </div>
       </main>
     </div>
