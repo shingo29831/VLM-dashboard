@@ -28,7 +28,7 @@ export default function App() {
   const [imageSrc, setImageSrc] = useState<string | null>(null);
   const [prompt, setPrompt] = useState('画面内の主要なメニューやボタンをすべてリストアップしてください。');  
   const [availableModels, setAvailableModels] = useState<AIModel[]>([]);
-  const [selectedModel, setSelectedModel] = useState('gemini-flash-latest');
+  const [selectedModel, setSelectedModel] = useState('');
   const [modelStatus, setModelStatus] = useState<FetchStatus>('idle');
   
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -52,12 +52,14 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
 
+  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
   useEffect(() => {
     const fetchModels = async () => {
       setModelStatus('loading');
       setErrorMessage(null);
       try {
-        const res = await fetch('http://localhost:3001/api/models');
+        const res = await fetch(`${API_BASE_URL}/api/models`);
         if (!res.ok) throw new Error(`サーバーエラー: ${res.status}`);
         const data = await res.json();
         if (data.models && data.models.length > 0) {
@@ -115,39 +117,54 @@ export default function App() {
       const resBlob = await fetch(imageSrc);
       const blob = await resBlob.blob();
 
-      const formData = new FormData();
-      formData.append('image', blob, 'screenshot.png');
-      formData.append('prompt', prompt);
-      formData.append('model', selectedModel);
+      const imageFormData = new FormData();
+      imageFormData.append('image', blob, 'screenshot.png');
 
-      const response = await fetch('http://localhost:3001/api/analyze', {
-        method: 'POST',
-        body: formData,
-      });
+      const vlmFormData = new FormData();
+      vlmFormData.append('image', blob, 'screenshot.png');
+      vlmFormData.append('prompt', prompt);
+      vlmFormData.append('model', selectedModel);
 
-      if (!response.ok) throw new Error(`解析サーバーエラー: ${response.status}`);
-      const data = await response.json();
-      
-      setAiResponseText(data.text);
-      if (data.ocrElements) setOcrBoxCoords(data.ocrElements);
-      if (data.yoloElements) setYoloBoxCoords(data.yoloElements);
-      
-      if (data.usage) {
-        setCurrentUsage(data.usage);
-        setUsageLog(prev => [{
-          timestamp: new Date().toLocaleTimeString(),
-          model: selectedModel,
-          usage: data.usage
-        }, ...prev].slice(0, 10));
+      const [vlmRes, ocrRes, yoloRes] = await Promise.allSettled([
+        fetch(`${API_BASE_URL}/api/analyze`, { method: 'POST', body: vlmFormData }),
+        fetch(`${API_BASE_URL}/api/scan`, { method: 'POST', body: imageFormData }),
+        fetch(`${API_BASE_URL}/api/yolo`, { method: 'POST', body: imageFormData })
+      ]);
+
+      if (vlmRes.status === 'fulfilled' && vlmRes.value.ok) {
+        const vlmData = await vlmRes.value.json();
+        setAiResponseText(vlmData.text);
+        
+        if (vlmData.usage) {
+          setCurrentUsage(vlmData.usage);
+          setUsageLog(prev => [{
+            timestamp: new Date().toLocaleTimeString(),
+            model: selectedModel,
+            usage: vlmData.usage
+          }, ...prev].slice(0, 10));
+        }
+
+        const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
+        const matches = [...vlmData.text.matchAll(regex)];
+        const extractedCoords = matches.map((match: string[]) => [
+          parseFloat(match[1]), parseFloat(match[2]),
+          parseFloat(match[3]), parseFloat(match[4]),
+        ]);
+        setAiBoxCoords(extractedCoords);
+      } else {
+        throw new Error('VLM API通信エラーが発生しました。');
       }
 
-      const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
-      const matches = [...data.text.matchAll(regex)];
-      const extractedCoords = matches.map(match => [
-        parseFloat(match[1]), parseFloat(match[2]),
-        parseFloat(match[3]), parseFloat(match[4]),
-      ]);
-      setAiBoxCoords(extractedCoords);
+      if (ocrRes.status === 'fulfilled' && ocrRes.value.ok) {
+        const ocrData = await ocrRes.value.json();
+        if (ocrData.elements) setOcrBoxCoords(ocrData.elements);
+      }
+
+      if (yoloRes.status === 'fulfilled' && yoloRes.value.ok) {
+        const yoloData = await yoloRes.value.json();
+        if (yoloData.elements) setYoloBoxCoords(yoloData.elements);
+      }
+
     } catch (error: any) {
       setAiResponseText('エラーが発生しました。');
       setErrorMessage(error.message);

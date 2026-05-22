@@ -1,20 +1,19 @@
-# 役割: OpenCV, EasyOCR, YOLOv8 を用いたハイブリッド画像解析マイクロサービス
-# AI向け役割: Tesseractをより高精度な深層学習ベースのEasyOCRに換装。日本語・英語混じりのUIテキストを正確に読み取り、座標結合を行う。
+# 役割: OpenCV, EasyOCR, YOLOv8, VLM を用いた画像解析マイクロサービス
+# AI向け役割: 既存のOCR/YOLO機能に加えて、VLM(Vision-Language Model)を利用した画像テキスト解析APIエンドポイントを提供する。UIとロジックを疎結合に保つ。
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-import easyocr # ★ Tesseractの代わりにEasyOCRをインポート
+import easyocr
 from ultralytics import YOLO
+from typing import Optional
 
-# ★ EasyOCRのリーダーを初期化（日本語と英語に対応）
-# 初回起動時に自動で軽量な言語モデルがダウンロードされます
+from vlm_service import analyze_image_with_vlm, get_available_models, TokenUsage
+
 ocr_reader = easyocr.Reader(['ja', 'en'])
-
-# YOLOモデルの読み込み
 yolo_model = YOLO('yolov8n.pt') 
 
 app = FastAPI()
@@ -42,6 +41,10 @@ class YoloElement(BaseModel):
 class YoloResponse(BaseModel):
     elements: list[YoloElement]
 
+class VLMAnalyzeResponse(BaseModel):
+    text: str
+    usage: Optional[TokenUsage] = None
+
 # ---------------------------------------------------------
 # API 1: EasyOCRフルスキャン (精密な座標結合ロジック)
 # ---------------------------------------------------------
@@ -57,20 +60,17 @@ async def scan_image_for_ui(image: UploadFile = File(...)):
 
         height, width, _ = img.shape
         
-        # ★ EasyOCRでテキスト読み取りを実行
         print("\n=== [DEBUG] EasyOCR スキャン開始 ===")
         results = ocr_reader.readtext(img)
         
         raw_boxes = []
         for (bbox, text, prob) in results:
             text = text.strip()
-            # 信頼度が極端に低いものや空文字はスキップ
             if prob < 0.1 or not text:
                 continue
             if len(text) == 1 and not text.isalnum():
                 continue
                 
-            # bboxは4つの角の座標 [[x1,y1], [x2,y1], [x2,y2], [x1,y2]] なので最小/最大を計算
             x_min = int(min([p[0] for p in bbox]))
             y_min = int(min([p[1] for p in bbox]))
             x_max = int(max([p[0] for p in bbox]))
@@ -84,7 +84,6 @@ async def scan_image_for_ui(image: UploadFile = File(...)):
                 'y_max': y_max
             })
 
-        # Y中心座標(15px丸め) -> X座標の順でソートして結合（前回の優秀なロジックを流用）
         for b in raw_boxes:
             b['y_center'] = (b['y_min'] + b['y_max']) / 2
         raw_boxes.sort(key=lambda b: (b['y_center'] // 15, b['x_min']))
@@ -106,7 +105,7 @@ async def scan_image_for_ui(image: UploadFile = File(...)):
                 if min_h > 0 and y_overlap > min_h * 0.3:
                     gap = left - block['x_max']
                     if -box_h * 2.0 <= gap <= box_h * 2.5:
-                        block['text'] += " " + text # EasyOCRは単語間のスペースを空ける
+                        block['text'] += " " + text 
                         block['x_min'] = min(block['x_min'], left)
                         block['y_min'] = min(block['y_min'], top)
                         block['x_max'] = max(block['x_max'], right)
@@ -148,7 +147,6 @@ async def scan_image_for_ui(image: UploadFile = File(...)):
 # ---------------------------------------------------------
 @app.post("/api/yolo", response_model=YoloResponse)
 async def run_yolo_detection(image: UploadFile = File(...)):
-    # ...（前回と同じYOLOの処理）...
     try:
         contents = await image.read()
         nparr = np.frombuffer(contents, np.uint8)
@@ -172,6 +170,38 @@ async def run_yolo_detection(image: UploadFile = File(...)):
                 ))
         return YoloResponse(elements=yolo_elements)
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# API 3: VLMによる画像解析 (外部LM Studio連携)
+# ---------------------------------------------------------
+@app.get("/api/models")
+async def fetch_models():
+    models = get_available_models()
+    return {"models": models}
+
+@app.post("/api/analyze", response_model=VLMAnalyzeResponse)
+async def analyze_image_vlm(
+    image: UploadFile = File(...),
+    prompt: str = Form(...),
+    model: str = Form(...)
+):
+    try:
+        contents = await image.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            
+        result_text, usage_info = analyze_image_with_vlm(contents, prompt, model)
+        
+        return VLMAnalyzeResponse(
+            text=result_text,
+            usage=usage_info
+        )
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error processing image in VLM analyze: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
