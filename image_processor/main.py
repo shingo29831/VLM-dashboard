@@ -14,7 +14,8 @@ from typing import Optional
 from vlm_service import analyze_image_with_vlm, get_available_models, TokenUsage
 
 ocr_reader = easyocr.Reader(['ja', 'en'])
-yolo_model = YOLO('yolov8n.pt') 
+
+yolo_model = YOLO('ui-master-best.pt') 
 
 app = FastAPI()
 
