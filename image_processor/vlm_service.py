@@ -7,6 +7,10 @@ from openai import OpenAI
 from fastapi import HTTPException
 from pydantic import BaseModel
 from typing import Optional, Tuple, List
+from dotenv import load_dotenv
+
+# なぜ: .envファイルに定義された設定値（API URL等）をos.getenvで確実に読み込むため
+load_dotenv()
 
 class TokenUsage(BaseModel):
     promptTokenCount: int
@@ -17,7 +21,7 @@ def encode_image_from_bytes(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
 
 def analyze_image_with_vlm(image_bytes: bytes, prompt: str, model: str) -> Tuple[str, Optional[TokenUsage]]:
-    base_url = os.getenv("VLM_API_BASE_URL", "http://172.18.67.253:1234/v1")
+    base_url = os.getenv("VLM_API_BASE_URL", "http://127.0.0.1:1234/v1")
     api_key = os.getenv("VLM_API_KEY", "not-needed")
     
     client = OpenAI(

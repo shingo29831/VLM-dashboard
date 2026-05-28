@@ -3,6 +3,7 @@
  * AI向け役割: 座標データの正規化、レイヤー別の表示切り替え、トークン使用履歴の管理、および各エンジンの解析ログをタブ表示する。
  */
 import React, { useState, useRef, useEffect, type MouseEvent } from 'react';
+import { fetchWithRetry } from './utils/fetchClient';
 
 interface TokenUsage {
   promptTokenCount: number;
@@ -21,6 +22,12 @@ interface AIModel {
   displayName: string;
 }
 
+interface BoundingBoxElement {
+  text?: string;
+  label?: string;
+  bounding_box: [number, number, number, number];
+}
+
 type FetchStatus = 'idle' | 'loading' | 'success' | 'error';
 type LogTab = 'vlm' | 'ocr' | 'yolo';
 
@@ -35,8 +42,8 @@ export default function App() {
   const [hoverCoords, setHoverCoords] = useState({ x: 0, y: 0 });
   
   const [aiBoxCoords, setAiBoxCoords] = useState<number[][]>([]);
-  const [ocrBoxCoords, setOcrBoxCoords] = useState<any[]>([]); 
-  const [yoloBoxCoords, setYoloBoxCoords] = useState<any[]>([]); 
+  const [ocrBoxCoords, setOcrBoxCoords] = useState<BoundingBoxElement[]>([]); 
+  const [yoloBoxCoords, setYoloBoxCoords] = useState<BoundingBoxElement[]>([]); 
   const [aiResponseText, setAiResponseText] = useState('');
 
   const [showOcr, setShowOcr] = useState(true);
@@ -49,6 +56,8 @@ export default function App() {
   const [activeLogTab, setActiveLogTab] = useState<LogTab>('vlm');
   
   const [isDragging, setIsDragging] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false); // 解析中フラグ
+
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
 
@@ -59,8 +68,7 @@ export default function App() {
       setModelStatus('loading');
       setErrorMessage(null);
       try {
-        const res = await fetch(`${API_BASE_URL}/api/models`);
-        if (!res.ok) throw new Error(`サーバーエラー: ${res.status}`);
+        const res = await fetchWithRetry(`${API_BASE_URL}/api/models`, {}, 2, 5000);
         const data = await res.json();
         if (data.models && data.models.length > 0) {
           setAvailableModels(data.models);
@@ -69,14 +77,14 @@ export default function App() {
         } else {
           throw new Error('利用可能なモデルが見つかりませんでした');
         }
-      } catch (error: any) {
+      } catch (error: unknown) {
         console.error('モデル一覧の取得に失敗しました:', error);
         setModelStatus('error');
-        setErrorMessage(error.message || 'モデルの取得中に不明なエラーが発生しました');
+        setErrorMessage(error instanceof Error ? error.message : 'モデルの取得中に不明なエラーが発生しました');
       }
     };
     fetchModels();
-  }, []);
+  }, [API_BASE_URL]);
 
   const processImageFile = (file: File) => {
     if (!file.type.startsWith('image/')) return;
@@ -106,7 +114,9 @@ export default function App() {
   };
 
   const handleRunAi = async () => {
-    if (!imageSrc) return;
+    if (!imageSrc || isAnalyzing) return;
+    
+    setIsAnalyzing(true);
     setAiResponseText('AIに問い合わせ中...');
     setAiBoxCoords([]);
     setOcrBoxCoords([]);
@@ -117,57 +127,96 @@ export default function App() {
       const resBlob = await fetch(imageSrc);
       const blob = await resBlob.blob();
 
-      const imageFormData = new FormData();
-      imageFormData.append('image', blob, 'screenshot.png');
-
+      // なぜ: FormDataのストリームは一度のfetchで消費されるブラウザがあるため、リクエストごとに独立して生成する
       const vlmFormData = new FormData();
       vlmFormData.append('image', blob, 'screenshot.png');
       vlmFormData.append('prompt', prompt);
       vlmFormData.append('model', selectedModel);
 
+      const ocrFormData = new FormData();
+      ocrFormData.append('image', blob, 'screenshot.png');
+
+      const yoloFormData = new FormData();
+      yoloFormData.append('image', blob, 'screenshot.png');
+
       const [vlmRes, ocrRes, yoloRes] = await Promise.allSettled([
-        fetch(`${API_BASE_URL}/api/analyze`, { method: 'POST', body: vlmFormData }),
-        fetch(`${API_BASE_URL}/api/scan`, { method: 'POST', body: imageFormData }),
-        fetch(`${API_BASE_URL}/api/yolo`, { method: 'POST', body: imageFormData })
+        fetchWithRetry(`${API_BASE_URL}/api/analyze`, { method: 'POST', body: vlmFormData }, 1, 60000),
+        fetchWithRetry(`${API_BASE_URL}/api/scan`, { method: 'POST', body: ocrFormData }, 2, 30000),
+        fetchWithRetry(`${API_BASE_URL}/api/yolo`, { method: 'POST', body: yoloFormData }, 2, 30000)
       ]);
 
-      if (vlmRes.status === 'fulfilled' && vlmRes.value.ok) {
-        const vlmData = await vlmRes.value.json();
-        setAiResponseText(vlmData.text);
-        
-        if (vlmData.usage) {
-          setCurrentUsage(vlmData.usage);
-          setUsageLog(prev => [{
-            timestamp: new Date().toLocaleTimeString(),
-            model: selectedModel,
-            usage: vlmData.usage
-          }, ...prev].slice(0, 10));
+      const currentErrors: string[] = [];
+
+      // VLMの個別処理
+      if (vlmRes.status === 'fulfilled') {
+        try {
+          const vlmData = await vlmRes.value.json();
+          if (vlmData.text) {
+            setAiResponseText(vlmData.text);
+            const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
+            const matches = [...vlmData.text.matchAll(regex)];
+            const extractedCoords = matches.map((match: string[]) => [
+              parseFloat(match[1]), parseFloat(match[2]),
+              parseFloat(match[3]), parseFloat(match[4]),
+            ]);
+            setAiBoxCoords(extractedCoords);
+          } else {
+            currentErrors.push('VLMのテキストが見つかりません');
+          }
+          if (vlmData.usage) {
+            setCurrentUsage(vlmData.usage);
+            setUsageLog(prev => [{
+              timestamp: new Date().toLocaleTimeString(),
+              model: selectedModel,
+              usage: vlmData.usage
+            }, ...prev].slice(0, 10));
+          }
+        } catch (error) {
+          currentErrors.push('VLMのレスポンス解析に失敗しました');
+          setAiResponseText('VLMの解析に失敗しました。');
         }
-
-        const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
-        const matches = [...vlmData.text.matchAll(regex)];
-        const extractedCoords = matches.map((match: string[]) => [
-          parseFloat(match[1]), parseFloat(match[2]),
-          parseFloat(match[3]), parseFloat(match[4]),
-        ]);
-        setAiBoxCoords(extractedCoords);
       } else {
-        throw new Error('VLM API通信エラーが発生しました。');
+        const reason = vlmRes.reason instanceof Error ? vlmRes.reason.message : String(vlmRes.reason);
+        currentErrors.push(`VLMエラー: ${reason}`);
+        setAiResponseText('VLMの通信に失敗しました。');
       }
 
-      if (ocrRes.status === 'fulfilled' && ocrRes.value.ok) {
-        const ocrData = await ocrRes.value.json();
-        if (ocrData.elements) setOcrBoxCoords(ocrData.elements);
+      // OCRの個別処理
+      if (ocrRes.status === 'fulfilled') {
+        try {
+          const ocrData = await ocrRes.value.json();
+          if (ocrData.elements) setOcrBoxCoords(ocrData.elements);
+        } catch (error) {
+          currentErrors.push('OCRのレスポンス解析に失敗しました');
+        }
+      } else {
+        const reason = ocrRes.reason instanceof Error ? ocrRes.reason.message : String(ocrRes.reason);
+        currentErrors.push(`OCRエラー: ${reason}`);
       }
 
-      if (yoloRes.status === 'fulfilled' && yoloRes.value.ok) {
-        const yoloData = await yoloRes.value.json();
-        if (yoloData.elements) setYoloBoxCoords(yoloData.elements);
+      // YOLOの個別処理
+      if (yoloRes.status === 'fulfilled') {
+        try {
+          const yoloData = await yoloRes.value.json();
+          if (yoloData.elements) setYoloBoxCoords(yoloData.elements);
+        } catch (error) {
+          currentErrors.push('YOLOのレスポンス解析に失敗しました');
+        }
+      } else {
+        const reason = yoloRes.reason instanceof Error ? yoloRes.reason.message : String(yoloRes.reason);
+        currentErrors.push(`YOLOエラー: ${reason}`);
       }
 
-    } catch (error: any) {
-      setAiResponseText('エラーが発生しました。');
-      setErrorMessage(error.message);
+      if (currentErrors.length > 0) {
+        setErrorMessage(currentErrors.join(' / '));
+      }
+
+    } catch (error: unknown) {
+      setAiResponseText('致命的なエラーが発生しました。');
+      setErrorMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      // 成功・失敗に関わらず確実にローディング状態を解除
+      setIsAnalyzing(false);
     }
   };
 
@@ -250,10 +299,20 @@ export default function App() {
 
         <button 
           onClick={handleRunAi}
-          disabled={!imageSrc || modelStatus !== 'success'}
-          className="w-full bg-blue-600 text-white py-4 rounded-2xl hover:bg-blue-700 disabled:bg-gray-200 font-bold shadow-lg shadow-blue-100 transition-all active:scale-95 text-sm"
+          disabled={!imageSrc || modelStatus !== 'success' || isAnalyzing}
+          className={`w-full py-4 rounded-2xl font-bold shadow-lg transition-all text-sm flex items-center justify-center gap-2
+            ${isAnalyzing
+              ? 'bg-blue-400 cursor-not-allowed text-white shadow-none'
+              : 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-100 active:scale-95 disabled:bg-gray-200 disabled:text-gray-400'
+            }`}
         >
-          Run Analysis
+          {isAnalyzing && (
+            <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+          )}
+          {isAnalyzing ? 'Analyzing...' : 'Run Analysis'}
         </button>
 
         {/* 履歴と統計 */}
@@ -319,6 +378,19 @@ export default function App() {
                 style={{ width: 'auto', height: 'auto' }}
                 onMouseMove={handleMouseMove}
               />
+
+              {/* 解析中の半透明オーバーレイとスピナー */}
+              {isAnalyzing && (
+                <div className="absolute inset-0 bg-white/60 backdrop-blur-[2px] flex items-center justify-center z-50 rounded-lg">
+                  <div className="flex flex-col items-center gap-3">
+                    <svg className="animate-spin h-12 w-12 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span className="text-blue-600 font-bold text-sm tracking-widest uppercase drop-shadow-sm">Processing...</span>
+                  </div>
+                </div>
+              )}
               
               {/* OCR レイヤー (青) */}
               {showOcr && ocrBoxCoords.map((el, i) => (
@@ -337,7 +409,7 @@ export default function App() {
               ))}
 
               {/* YOLO レイヤー (緑) */}
-              {showYolo && yoloBoxCoords.map((el: any, i: number) => (
+              {showYolo && yoloBoxCoords.map((el, i) => (
                 <div 
                   key={`yolo-${i}`}
                   className="absolute border-2 border-green-500 bg-green-500/10 pointer-events-none transition-all z-20"
@@ -410,7 +482,7 @@ export default function App() {
             )}
             {activeLogTab === 'yolo' && (
               <pre className="text-xs text-gray-600 font-mono whitespace-pre-wrap">
-                {yoloBoxCoords.length > 0 ? JSON.stringify(yoloBoxCoords, null, 2) : "No YOLO data available. (403 Forbidden or not executed)"}
+                {yoloBoxCoords.length > 0 ? JSON.stringify(yoloBoxCoords, null, 2) : "No YOLO data available."}
               </pre>
             )}
           </div>

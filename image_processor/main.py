@@ -149,6 +149,7 @@ async def scan_image_for_ui(image: UploadFile = File(...)):
 @app.post("/api/yolo", response_model=YoloResponse)
 async def run_yolo_detection(image: UploadFile = File(...)):
     try:
+        print("\n=== [DEBUG] YOLO 物体検出開始 ===")
         contents = await image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -169,8 +170,11 @@ async def run_yolo_detection(image: UploadFile = File(...)):
                     confidence=confidence,
                     bounding_box=[int((y1/height)*1000), int((x1/width)*1000), int((y2/height)*1000), int((x2/width)*1000)]
                 ))
+                
+        print(f"=== [DEBUG] YOLO {len(yolo_elements)}個のUI要素を検出完了 ===")
         return YoloResponse(elements=yolo_elements)
     except Exception as e:
+        print(f"Error processing image in YOLO: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------
