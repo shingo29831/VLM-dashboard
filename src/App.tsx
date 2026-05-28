@@ -56,7 +56,7 @@ export default function App() {
   const [activeLogTab, setActiveLogTab] = useState<LogTab>('vlm');
   
   const [isDragging, setIsDragging] = useState(false);
-  const [isAnalyzing, setIsAnalyzing] = useState(false); // 解析中フラグ
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement>(null);
@@ -124,98 +124,74 @@ export default function App() {
     setErrorMessage(null);
 
     try {
+      // なぜ: Blobストリームの競合(ロック)を防ぐため、元の画像をArrayBuffer化し、通信ごとに独立したBlobを生成する
       const resBlob = await fetch(imageSrc);
-      const blob = await resBlob.blob();
+      const arrayBuffer = await resBlob.arrayBuffer();
+      const mimeType = resBlob.headers.get('content-type') || 'image/png';
 
-      // なぜ: FormDataのストリームは一度のfetchで消費されるブラウザがあるため、リクエストごとに独立して生成する
       const vlmFormData = new FormData();
-      vlmFormData.append('image', blob, 'screenshot.png');
+      vlmFormData.append('image', new Blob([arrayBuffer], { type: mimeType }), 'screenshot.png');
       vlmFormData.append('prompt', prompt);
       vlmFormData.append('model', selectedModel);
 
       const ocrFormData = new FormData();
-      ocrFormData.append('image', blob, 'screenshot.png');
+      ocrFormData.append('image', new Blob([arrayBuffer], { type: mimeType }), 'screenshot.png');
 
       const yoloFormData = new FormData();
-      yoloFormData.append('image', blob, 'screenshot.png');
+      yoloFormData.append('image', new Blob([arrayBuffer], { type: mimeType }), 'screenshot.png');
 
-      const [vlmRes, ocrRes, yoloRes] = await Promise.allSettled([
-        fetchWithRetry(`${API_BASE_URL}/api/analyze`, { method: 'POST', body: vlmFormData }, 1, 60000),
-        fetchWithRetry(`${API_BASE_URL}/api/scan`, { method: 'POST', body: ocrFormData }, 2, 30000),
-        fetchWithRetry(`${API_BASE_URL}/api/yolo`, { method: 'POST', body: yoloFormData }, 2, 30000)
-      ]);
-
-      const currentErrors: string[] = [];
-
-      // VLMの個別処理
-      if (vlmRes.status === 'fulfilled') {
-        try {
-          const vlmData = await vlmRes.value.json();
-          if (vlmData.text) {
-            setAiResponseText(vlmData.text);
+      // なぜ: Promise.allSettledによる同期ブロックを避け、完了したものから即座に画面を描画(State更新)するため個別のPromiseチェーンを構築する
+      // なぜ: FormDataを用いたPOST通信のリトライはブラウザ仕様でTypeErrorを引き起こすため、ここではネイティブのfetchを使用する
+      const vlmTask = fetch(`${API_BASE_URL}/api/analyze`, { method: 'POST', body: vlmFormData })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (data.text) {
+            setAiResponseText(data.text);
             const regex = /\[\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\]/g;
-            const matches = [...vlmData.text.matchAll(regex)];
-            const extractedCoords = matches.map((match: string[]) => [
-              parseFloat(match[1]), parseFloat(match[2]),
-              parseFloat(match[3]), parseFloat(match[4]),
-            ]);
-            setAiBoxCoords(extractedCoords);
-          } else {
-            currentErrors.push('VLMのテキストが見つかりません');
+            const matches = [...data.text.matchAll(regex)];
+            setAiBoxCoords(matches.map((m: string[]) => [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])]));
           }
-          if (vlmData.usage) {
-            setCurrentUsage(vlmData.usage);
-            setUsageLog(prev => [{
-              timestamp: new Date().toLocaleTimeString(),
-              model: selectedModel,
-              usage: vlmData.usage
-            }, ...prev].slice(0, 10));
+          if (data.usage) {
+            setCurrentUsage(data.usage);
+            setUsageLog(prev => [{ timestamp: new Date().toLocaleTimeString(), model: selectedModel, usage: data.usage }, ...prev].slice(0, 10));
           }
-        } catch (error) {
-          currentErrors.push('VLMのレスポンス解析に失敗しました');
+          return null;
+        })
+        .catch(err => {
           setAiResponseText('VLMの解析に失敗しました。');
-        }
-      } else {
-        const reason = vlmRes.reason instanceof Error ? vlmRes.reason.message : String(vlmRes.reason);
-        currentErrors.push(`VLMエラー: ${reason}`);
-        setAiResponseText('VLMの通信に失敗しました。');
-      }
+          return `VLM通信エラー: ${err.message}`;
+        });
 
-      // OCRの個別処理
-      if (ocrRes.status === 'fulfilled') {
-        try {
-          const ocrData = await ocrRes.value.json();
-          if (ocrData.elements) setOcrBoxCoords(ocrData.elements);
-        } catch (error) {
-          currentErrors.push('OCRのレスポンス解析に失敗しました');
-        }
-      } else {
-        const reason = ocrRes.reason instanceof Error ? ocrRes.reason.message : String(ocrRes.reason);
-        currentErrors.push(`OCRエラー: ${reason}`);
-      }
+      const ocrTask = fetch(`${API_BASE_URL}/api/scan`, { method: 'POST', body: ocrFormData })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (data.elements) setOcrBoxCoords(data.elements);
+          return null;
+        })
+        .catch(err => `OCR通信エラー: ${err.message}`);
 
-      // YOLOの個別処理
-      if (yoloRes.status === 'fulfilled') {
-        try {
-          const yoloData = await yoloRes.value.json();
-          if (yoloData.elements) setYoloBoxCoords(yoloData.elements);
-        } catch (error) {
-          currentErrors.push('YOLOのレスポンス解析に失敗しました');
-        }
-      } else {
-        const reason = yoloRes.reason instanceof Error ? yoloRes.reason.message : String(yoloRes.reason);
-        currentErrors.push(`YOLOエラー: ${reason}`);
-      }
+      const yoloTask = fetch(`${API_BASE_URL}/api/yolo`, { method: 'POST', body: yoloFormData })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          if (data.elements) setYoloBoxCoords(data.elements);
+          return null;
+        })
+        .catch(err => `YOLO通信エラー: ${err.message}`);
 
-      if (currentErrors.length > 0) {
-        setErrorMessage(currentErrors.join(' / '));
+      // すべての並列タスクの完了を待機し、返却されたエラー文字列（null以外）があれば表示
+      const results = await Promise.all([vlmTask, ocrTask, yoloTask]);
+      const errors = results.filter(Boolean);
+      if (errors.length > 0) {
+        setErrorMessage(errors.join(' / '));
       }
 
     } catch (error: unknown) {
       setAiResponseText('致命的なエラーが発生しました。');
       setErrorMessage(error instanceof Error ? error.message : String(error));
     } finally {
-      // 成功・失敗に関わらず確実にローディング状態を解除
       setIsAnalyzing(false);
     }
   };
